@@ -32,8 +32,9 @@ import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 
-from datasets                   import ImageNet, oxford_iiit_pet, oxford_flowers, magnet_MNIST
+from datasets                   import ImageNet, oxford_iiit_pet, oxford_flowers, magnet_MNIST, customCIFAR10
 from models                     import magnetInception
+from torchvision.models         import resnet18, ResNet18_Weights
 from tensorboardX               import SummaryWriter    as Logger
 from util.torch_utils           import to_var, save_checkpoint, AverageMeter, accuracy
 from util                       import magnet_loss, triplet_loss, softkNN_metrics, softkNC_metrics
@@ -49,7 +50,6 @@ import torch.nn.functional as F
 def main(args):
     curr_time = time.time()
 
-
     print("#############  Read in Database   ##############")
     train_loader, valid_loader = get_loaders()
 
@@ -62,9 +62,18 @@ def main(args):
     # however, the differences should be minor in terms of implementation and impact on results
 
     if args.dataset == "MNIST":
-        model   = Net(args.embedding_size)
+        model = Net(args.embedding_size)
+    elif args.dataset == "CIFAR10":
+        model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        model.fc = nn.Linear(in_features=model.fc.in_features, out_features=args.embedding_size)
+        for name, param in model.named_parameters():
+            if name.startswith("conv1.") or name.startswith("bn1.") or name.startswith("layer1.") or name.startswith("layer2.") or name.startswith("layer3.0."):
+                param.requires_grad = False
     else:
-        model   = magnetInception(args.embedding_size)
+        model = magnetInception(args.embedding_size)
+
+    print("# total params:", sum(p.numel() for p in model.parameters()))
+    print("# trainable params:", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
     if args.resume is not None:
         print("Loading pretrained Module")
@@ -81,7 +90,6 @@ def main(args):
 
     model   = torch.nn.DataParallel(model).cuda()
 
-
     # Criterion was not specified by the paper, it was assumed to be cross entropy (as commonly used)
     if args.loss == "magnet":
         criterion = magnet_loss(D = args.D, M = args.M, alpha = args.GAP).cuda()    # Loss function
@@ -95,7 +103,6 @@ def main(args):
 
     params  = list(model.parameters())                                      # Parameters to train
 
-
     # Optimizer -- the optimizer is not specified in the paper, and was ssumed to
     # be SGD. The parameters of the model were also not specified and were set
     # to commonly values used by pytorch (lr = 0.1, momentum = 0.3, decay = 1e-4)
@@ -105,32 +112,25 @@ def main(args):
                              milestones=list(range(0, args.num_epochs, 1)),
                              gamma=args.annealing_factor)
 
-
     print("Time taken:  {} seconds".format(time.time() - curr_time) )
     curr_time = time.time()
 
     print("#############  Start Training     ##############")
     total_step = len(train_loader)
 
-
     cluster_centers, cluster_assignment = indexing_step(    model = model,
                                                             data_loader = train_loader,
                                                             cluster_centers = None)
-
-
 
     loss_vector = 10. * np.ones(args.K * args.num_classes)
     loss_count  = np.ones(args.K * args.num_classes)
 
     for epoch in range(0, args.num_epochs):
 
-
         if args.evaluate_only:         exit()
-        if args.optimizer == 'sgd':    scheduler.step()
 
         order = define_order(cluster_assignment, cluster_centers, loss_vector/loss_count)
         train_loader.dataset.update_read_order(order)
-
 
         logger.add_scalar("Misc/Epoch Number", epoch, epoch * total_step)
         loss_vector, loss_count, stdev = train_step(   model        = model,
@@ -146,7 +146,7 @@ def main(args):
 
         logger.add_scalar(args.dataset + "/STDEV ",   stdev,   epoch * total_step)
 
-        if epoch % 3 == 0:
+        if epoch % args.eval_epoch == 0:
             curr_loss, curr_wacc = eval_step(   model       = model,
                                                 data_loader = train_loader,
                                                 criterion   = criterion,
@@ -155,7 +155,6 @@ def main(args):
                                                 stdev       = stdev,
                                                 cluster_centers = cluster_centers)
 
-
             curr_loss, curr_wacc = eval_step(   model       = model,
                                                 data_loader = valid_loader,
                                                 criterion   = criterion,
@@ -163,6 +162,8 @@ def main(args):
                                                 datasplit   = "valid",
                                                 stdev       = stdev,
                                                 cluster_centers = cluster_centers)
+
+        if args.optimizer == 'sgd':    scheduler.step()
 
         cluster_centers, assignment = indexing_step( model = model, data_loader = train_loader, cluster_centers = cluster_centers)
 
@@ -175,15 +176,15 @@ def main(args):
         #                          curr_acc   = curr_wacc,
         #                          filename   = ('model@epoch%d.pkl' %(epoch)))
 
-    # Final save of the model
-    args = save_checkpoint(  model      = model,
-                             optimizer  = optimizer,
-                             curr_epoch = epoch,
-                             curr_loss  = curr_loss,
-                             curr_step  = (total_step * epoch),
-                             args       = args,
-                             curr_acc   = curr_wacc,
-                             filename   = ('model@epoch%d.pkl' %(epoch)))
+        if epoch % args.save_epoch == 0:
+            args = save_checkpoint(  model      = model,
+                                    optimizer  = optimizer,
+                                    curr_epoch = epoch,
+                                    curr_loss  = curr_loss,
+                                    curr_step  = (total_step * epoch),
+                                    args       = args,
+                                    curr_acc   = curr_wacc,
+                                    filename   = ('model@epoch%d.pkl' %(epoch)))
 
 def train_step(model, train_loader, criterion, optimizer, epoch, step, valid_loader = None, assignment = None, loss_vector = None, loss_count=None):
 
@@ -243,7 +244,6 @@ def train_step(model, train_loader, criterion, optimizer, epoch, step, valid_loa
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1, top5=top5))
 
-
             # Log items
             logger.add_scalar("Misc/batch time (s)",    batch_time.avg,                                   step + i)
             logger.add_scalar("Misc/Train_%",           1.0 - (data_time.avg/batch_time.avg),             step + i)
@@ -263,9 +263,7 @@ def train_step(model, train_loader, criterion, optimizer, epoch, step, valid_loa
                                 datasplit   = "valid")
             model.train()
 
-
     return loss_vector, loss_count, stdev.avg
-
 
 def eval_step( model, data_loader,  criterion, step, datasplit, stdev, cluster_centers):
     batch_time = AverageMeter()
@@ -277,15 +275,16 @@ def eval_step( model, data_loader,  criterion, step, datasplit, stdev, cluster_c
     model.eval()
 
     end = time.time()
-    for i, (input, target, inst_indices) in enumerate(data_loader):
-        input_var = torch.autograd.Variable(input.cuda(), volatile=True)
-        target_var = torch.autograd.Variable(target.cuda(async=True), volatile=True)
+    with torch.no_grad():
+        for i, (input, target, inst_indices) in enumerate(data_loader):
+            input_var = torch.autograd.Variable(input.cuda())
+            target_var = torch.autograd.Variable(target.cuda())
 
-        # compute output
-        output = model(input_var)
+            # compute output
+            output = model(input_var)
 
-        # measure accuracy and record loss
-        metrics.update(output, target)
+            # measure accuracy and record loss
+            metrics.update(output, target)
 
     print("Evaluation: Forward Embedding Calculation (Time Elapsed {time:.3f})".format(time=time.time() - end))
     curr_time = time.time()
@@ -336,10 +335,8 @@ def indexing_step(model, data_loader, cluster_centers):
 
         return cluster_centers, assignment
 
-
 def cluster_assignment(indices, embeddings, labels, init_centers):
     cluster_nums    = args.num_classes * args.K
-
 
     assignment      = [-1] * len(indices)
     cluster_centers = np.zeros((cluster_nums, args.embedding_size))
@@ -362,7 +359,7 @@ def cluster_assignment(indices, embeddings, labels, init_centers):
         else:
             c_init_centers = init_centers[i*args.K:(i+1)*args.K, :]
 
-        kmeans = KMeans(n_clusters=args.K, init = c_init_centers).fit(class_dict[i]['embeddings'])
+        kmeans = KMeans(n_clusters=args.K, init=c_init_centers, n_init="auto").fit(class_dict[i]['embeddings'])
         k_labels    = kmeans.labels_
         k_centers   = kmeans.cluster_centers_
 
@@ -395,12 +392,10 @@ def define_order(cluster_assignment, cluster_centers, loss_vector):
             cluster_distances[i][j] = d
             cluster_distances[j][i] = d
 
-
     #construct useful dict
     cluster_dict = {}
     for i in range(0, num_clusters):
         cluster_dict[i] = []
-
 
     for i in range(0, len(cluster_assignment)):
         cluster_dict[cluster_assignment[i]].append(i)
@@ -464,22 +459,25 @@ def define_order(cluster_assignment, cluster_centers, loss_vector):
                 cluster_to_remove.append(Mi)
     return order
 
-
 def get_loaders():
 
     # Data loading code (From PyTorch example https://github.com/pytorch/examples/blob/master/imagenet/main.py)
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    if args.dataset == "CIFAR10":
+        input_size = 224
+    else:
+        input_size = 299
 
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(299),
+        transforms.RandomResizedCrop(input_size),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize,
     ])
 
     valid_transform = transforms.Compose([
-        transforms.Resize((299, 299)),
+        transforms.Resize((input_size, input_size)),
         # transforms.CenterCrop(224),
         transforms.ToTensor(),
         normalize,
@@ -503,6 +501,9 @@ def get_loaders():
                                     transforms.ToTensor(),
                                     transforms.Normalize((0.1307,), (0.3081,))
                             ]))
+    elif args.dataset == "CIFAR10":
+        train_dataset = customCIFAR10(root='../data', train=True, download=True, transform=valid_transform)
+        valid_dataset = customCIFAR10(root='../data', train=False, download=True, transform=valid_transform)
     else:
         print("No dataset generated!")
         exit()
@@ -543,6 +544,7 @@ class Net(torch.nn.Module):
         x = F.dropout(x, training=self.training)
         x = self.fc2(x)
         return x
+
 
 if __name__ == '__main__':
 
@@ -587,7 +589,6 @@ if __name__ == '__main__':
     parser.add_argument('--GAP',                type=float, default=4)       # Number of examples per cluster
     parser.add_argument('--NUM_BATCHES',        type=int, default=100)       # Number of examples per cluster
 
-
     args = parser.parse_args()
     print(args)
     print("")
@@ -603,6 +604,9 @@ if __name__ == '__main__':
     elif args.dataset == "flowers":
         args.data_path = "/z/home/mbanani/datasets/Oxford_Flowers/"
         args.num_classes = 102
+    elif args.dataset == "CIFAR10":
+        args.data_path = None
+        args.num_classes = 10
 
     root_dir                    = os.path.dirname(os.path.abspath(__file__))
     experiment_result_dir       = os.path.join(root_dir, os.path.join('experiments',args.dataset))
@@ -622,7 +626,6 @@ if __name__ == '__main__':
     if args.M > (args.K * args.num_classes):
         print("Number of imposter clusters is larger than number of possible clusters. Setting it to NUM_CLUSTERS - 2")
         args.M = (args.K * args.num_classes) - 2
-
 
     # Define Logger
     tensorboard_logdir = '/z/home/mbanani/tensorboard_logs'
