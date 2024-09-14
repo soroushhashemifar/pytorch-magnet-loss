@@ -15,37 +15,29 @@ which is pretrained on ImageNet for 3 epochs only.
 import argparse
 import os
 import sys
-import shutil
 import time
+
+import numpy as np
 import torch
-
-import numpy                    as np
-import torchvision.models       as models
-import torchvision.transforms   as transforms
-import torchvision.datasets     as datasets
-
-
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.distributed as dist
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
+import torchvision.transforms as transforms
+from IPython import embed
+from sklearn.cluster import KMeans
+from tensorboardX import SummaryWriter as Logger
+from torch.optim.lr_scheduler import MultiStepLR
+from torchvision.models import ResNet18_Weights, resnet18
 
-from datasets                   import ImageNet, oxford_iiit_pet, oxford_flowers, magnet_MNIST, customCIFAR10
-from models                     import magnetInception
-from torchvision.models         import resnet18, ResNet18_Weights
-from tensorboardX               import SummaryWriter    as Logger
-from util.torch_utils           import to_var, save_checkpoint, AverageMeter, accuracy
-from util                       import magnet_loss, triplet_loss, softkNN_metrics, softkNC_metrics
-from torch.optim.lr_scheduler   import MultiStepLR
-from IPython                    import embed
-from sklearn.cluster            import KMeans
-from torch.utils.data.sampler   import Sampler
+from datasets import (customCIFAR10, magnet_MNIST, oxford_flowers,
+                      oxford_iiit_pet)
+from models import magnetInception
+from util import magnet_loss, softkNC_metrics, triplet_loss
+from util.torch_utils import AverageMeter, save_checkpoint
 
-
-import torch.nn as nn
-import torch.nn.functional as F
 
 def main(args):
     curr_time = time.time()
@@ -118,14 +110,13 @@ def main(args):
     print("#############  Start Training     ##############")
     total_step = len(train_loader)
 
-    cluster_centers, cluster_assignment = indexing_step(    model = model,
-                                                            data_loader = train_loader,
-                                                            cluster_centers = None)
-
     loss_vector = 10. * np.ones(args.K * args.num_classes)
     loss_count  = np.ones(args.K * args.num_classes)
 
+    cluster_centers = None
     for epoch in range(0, args.num_epochs):
+
+        cluster_centers, cluster_assignment = indexing_step( model = model, data_loader = train_loader, cluster_centers = cluster_centers)
 
         if args.evaluate_only:         exit()
 
@@ -147,6 +138,7 @@ def main(args):
         logger.add_scalar(args.dataset + "/STDEV ",   stdev,   epoch * total_step)
 
         if epoch % args.eval_epoch == 0:
+            print("Evaluating on Train data")
             curr_loss, curr_wacc = eval_step(   model       = model,
                                                 data_loader = train_loader,
                                                 criterion   = criterion,
@@ -155,6 +147,7 @@ def main(args):
                                                 stdev       = stdev,
                                                 cluster_centers = cluster_centers)
 
+            print("Evaluating on Test data")
             curr_loss, curr_wacc = eval_step(   model       = model,
                                                 data_loader = valid_loader,
                                                 criterion   = criterion,
@@ -164,8 +157,6 @@ def main(args):
                                                 cluster_centers = cluster_centers)
 
         if args.optimizer == 'sgd':    scheduler.step()
-
-        cluster_centers, assignment = indexing_step( model = model, data_loader = train_loader, cluster_centers = cluster_centers)
 
         # args = save_checkpoint(  model      = model,
         #                          optimizer  = optimizer,
@@ -317,7 +308,7 @@ def indexing_step(model, data_loader, cluster_centers):
         data_loader.dataset.default_read_order()
 
         for i, (input, target, indices) in enumerate(data_loader):
-            input_var = torch.autograd.Variable(input, requires_grad=True)
+            input_var = torch.autograd.Variable(input)
             # compute output
             output = model(input_var)
 
@@ -325,8 +316,6 @@ def indexing_step(model, data_loader, cluster_centers):
             t_labels     += list(target.numpy())
             t_indices    += list(indices.numpy())
             del input, target, indices
-
-        # End FOR
 
         print('KNN: Forward Pass Time   {time:.3f}'.format(time=time.time() - curr_time))
         curr_time = time.time()
@@ -402,11 +391,11 @@ def define_order(cluster_assignment, cluster_centers, loss_vector):
 
     cluster_to_remove = []
     for i in range(0, num_clusters):
-        if len(cluster_dict[i]) < 4:
+        if len(cluster_dict[i]) < args.D: # source of error NaN probabilities 
             loss_vector[i] = 0.0
             cluster_to_remove.append(i)
             # print("Not sampling from cluster " + str(i) + " because it had less that 4 elements ")
-
+    
     loss_vector = np.asarray(loss_vector)
     loss_vector = loss_vector / sum(loss_vector)
     loss_vector = list(loss_vector)
@@ -457,6 +446,7 @@ def define_order(cluster_assignment, cluster_centers, loss_vector):
                 loss_vector[Mi] = 0.0
                 loss_vector = loss_vector / np.sum(loss_vector)
                 cluster_to_remove.append(Mi)
+
     return order
 
 def get_loaders():
@@ -507,7 +497,6 @@ def get_loaders():
     else:
         print("No dataset generated!")
         exit()
-    # END IF
 
     print("Generating Data Loaders")
     train_loader = torch.utils.data.DataLoader(

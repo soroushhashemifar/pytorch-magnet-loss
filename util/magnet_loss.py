@@ -6,10 +6,8 @@ Lua Implementation (not inspected yet TODO) (https://github.com/yenchanghsu/NNcl
 """
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-import numpy as np
-from IPython import embed
+
 
 class magnet_loss(nn.Module):
     def __init__(self, D = 12, M = 4, alpha = 7.18):
@@ -37,7 +35,6 @@ class magnet_loss(nn.Module):
         loss    = loss.cuda()
         loss    = torch.autograd.Variable(loss).cuda()
 
-
         ######################### Cluster Assignments ##########################
         # Generate a set of clusters in the batch
         # and the local indices corresponding to each of those clusters
@@ -50,7 +47,6 @@ class magnet_loss(nn.Module):
                 batch_clusters[curr_cluster].append(i)
             else:
                 batch_clusters[curr_cluster] = [i]
-
 
         ######################### Cluster Assignments ##########################
         clusters = list(batch_clusters.keys())
@@ -69,19 +65,16 @@ class magnet_loss(nn.Module):
             c_means[i]   = torch.autograd.Variable(c_means[i])
         """
         c_means = torch.stack([torch.mean(outputs[batch_clusters[clusters[m]]], dim=0) for m in range(0, len(clusters))])
-
+        
         for m in range(0, len(clusters)):
             c = clusters[m]
-            #c_means[m] += outputs[batch_clusters[c]].mean(dim=0)
 
-            for i in range(0, len(batch_clusters[c])):
-                stdev += (outputs[batch_clusters[c][i]] -  c_means[m]).norm(p=2).pow(2)
+            for d in range(0, len(batch_clusters[c])):
+                stdev += (outputs[batch_clusters[c][d]] -  c_means[m]).norm(p=2).pow(2)
                 num_instances += 1.0
 
-
         stdev = stdev / (num_instances - 1.0)
-        # stdev = stdev.pow(2)
-        stdev = -2.0 * stdev
+        variance = stdev.pow(2)
 
         ########################## CALCULATE THE LOSS #########################
         denom = []
@@ -90,26 +83,21 @@ class magnet_loss(nn.Module):
             denom[i]   = denom[i].cuda()
             denom[i]   = torch.autograd.Variable(denom[i])
 
-
-
-        inst_loss = {}
-        for m in range(0, self.M):
+        for m in range(0, len(clusters)):
             c = clusters[m]
-            for d in range(0, self.D):
-                try:
-                    ind   = batch_clusters[c][d]
-                except:
-                    embed()
+            for d in range(0, len(batch_clusters[c])):
+                ind   = batch_clusters[c][d]
                 for mF in range(0, len(clusters)):
                     if mF != m:
-                        denom[ind] += ((outputs[ind] - c_means[mF]).norm().pow(2) / stdev ).exp()
+                        denom[ind] += (-1 * (outputs[batch_clusters[c][d]] - c_means[mF]).norm(p=2).pow(2) / (2 * variance + 1e-8) ).exp() # adding epsilon 1e-8 to denominator to prevent becoming NaN
 
-                loss -=  (( ( (outputs[ind] - c_means[m]).norm().pow(2)/stdev - self.alpha ).exp() / denom[ind]).log() ).clamp(max=0.0) # negative in first term in exponent is covered by stdev, min because we are subtracting
+                denom[ind] += 1e-8
+                loss -=  (( ( -1 * (outputs[batch_clusters[c][d]] - c_means[m]).norm(p=2).pow(2) / (2 * variance + 1e-8) - self.alpha ).exp() / denom[ind] + 1e-8).log() ).clamp(min=0.0) # adding epsilon 1e-8 inside log to prevent becoming inf at zero value
 
-                loss_vector[c] -= (  ( (outputs[ind] - c_means[m]).norm().pow(2) / stdev - self.alpha ).exp() / denom[ind]).log().clamp(max = 0.0).cpu().data.numpy()[0]
+                loss_vector[c] -= (  ( -1 * (outputs[batch_clusters[c][d]] - c_means[m]).norm(p=2).pow(2) / (2 * variance + 1e-8) - self.alpha ).exp() / denom[ind] + 1e-8).log().clamp(min=0.0).cpu().data.numpy()[0]
                 loss_count[c] += 1.0
 
-
-
         loss /= num_instances
-        return loss, loss_vector/num_instances, loss_count, stdev.cpu().data.numpy()[0] / -2.0
+        loss_vector /= num_instances
+
+        return loss, loss_vector, loss_count, variance.cpu().data.numpy()[0]
