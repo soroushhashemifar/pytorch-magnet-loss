@@ -6,6 +6,7 @@ Lua Implementation (not inspected yet TODO) (https://github.com/yenchanghsu/NNcl
 """
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -89,12 +90,12 @@ class magnet_loss(nn.Module):
                 ind   = batch_clusters[c][d]
                 for mF in range(0, len(clusters)):
                     if mF != m:
-                        denom[ind] += (-1 * (outputs[batch_clusters[c][d]] - c_means[mF]).norm(p=2).pow(2) / (2 * variance + 1e-8) ).exp() # adding epsilon 1e-8 to denominator to prevent becoming NaN
+                        denom[ind] += (-1 * (outputs[batch_clusters[c][d]] - c_means[mF]).norm(p=2).pow(2) / (2 * variance + 1e-8) ).exp()
 
                 denom[ind] += 1e-8
-                loss -=  (( ( -1 * (outputs[batch_clusters[c][d]] - c_means[m]).norm(p=2).pow(2) / (2 * variance + 1e-8) - self.alpha ).exp() / denom[ind] + 1e-8).log() ).clamp(min=0.0) # adding epsilon 1e-8 inside log to prevent becoming inf at zero value
+                loss += F.relu(-1 * ( ( -1 * (outputs[batch_clusters[c][d]] - c_means[m]).norm(p=2).pow(2) / (2 * variance + 1e-8) - self.alpha ).exp() / denom[ind] + 1e-8).log() ) # negative in first term in exponent is covered by stdev, min because we are subtracting
 
-                loss_vector[c] -= (  ( -1 * (outputs[batch_clusters[c][d]] - c_means[m]).norm(p=2).pow(2) / (2 * variance + 1e-8) - self.alpha ).exp() / denom[ind] + 1e-8).log().clamp(min=0.0).cpu().data.numpy()[0]
+                loss_vector[c] += F.relu( -1 * (  ( -1 * (outputs[batch_clusters[c][d]] - c_means[m]).norm(p=2).pow(2) / (2 * variance + 1e-8) - self.alpha ).exp() / denom[ind] + 1e-8).log()).cpu().data.numpy()[0]
                 loss_count[c] += 1.0
 
         loss /= num_instances
